@@ -6,8 +6,11 @@ log = logging.getLogger(__name__)
 
 
 def pytest_exception_interact(node: Any, call: Any, report: Any) -> None:
+    testcase = getattr(node, "_testcase", None)
+    cluster = getattr(testcase, "cluster", None)
+    if cluster is None:
+        return
     try:
-        cluster = node._testcase.cluster
         log.error("Zookeeper cluster logs:")
         for logs in cluster.get_logs():
             log.error(logs)

@@ -89,6 +89,18 @@ class Lock:
     This is an exclusive lock. For a read/write lock, see :class:`WriteLock`
     and :class:`ReadLock`.
 
+    .. note::
+
+        This lock only coordinates access between Kazoo (and compatible
+        ZooKeeper) clients. It does **not** provide fencing for writes
+        made to external systems such as databases, object stores or
+        other services: a client whose session is suspended or expired
+        may still hold stale credentials or in-flight requests there.
+        To protect an external resource, carry a monotonically increasing
+        fencing token (for example the lock's sequence number or a
+        separate counter) into the external operation and have that
+        system reject requests carrying an older token.
+
     """
 
     # Node name, after the contender UUID, before the sequence
