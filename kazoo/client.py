@@ -129,6 +129,53 @@ WatchFunc = Callable[[WatchedEvent], Optional[bool]]
 GenericArgs = ParamSpec("GenericArgs")
 
 
+def _resolve_acl(
+    acl: Sequence[ACL] | None,
+    default_acl: Sequence[ACL] | None,
+) -> Sequence[ACL]:
+    """Resolve the effective ACL for a node creation request.
+
+    This is the single ACL contract shared by
+    :meth:`KazooClient.create`, :meth:`KazooClient.ensure_path`,
+    :meth:`TransactionRequest.create` and every recipe built on top of
+    them (locks, queues, ...):
+
+    * ``acl=None`` falls back to ``default_acl`` when that is set,
+      otherwise to :data:`~kazoo.security.OPEN_ACL_UNSAFE` (the
+      historical ZooKeeper default).
+    * An explicit non-empty tuple/list of :class:`~kazoo.security.ACL`
+      entries is used as-is.
+    * An empty tuple/list is rejected with :exc:`ValueError`:
+      ZooKeeper does not allow nodes without any ACL entries, and
+      silently substituting a default could mask a configuration
+      error.
+    * Any other value (a single :class:`~kazoo.security.ACL`, a
+      string, entries that are not ACLs, ...) raises :exc:`TypeError`
+      before anything is sent to ZooKeeper.
+
+    """
+    if acl is None:
+        if default_acl is None:
+            return OPEN_ACL_UNSAFE
+        acl = default_acl
+    if isinstance(acl, ACL) or not isinstance(acl, (tuple, list)):
+        raise TypeError(
+            "Invalid type for 'acl' (acl must be a tuple/list of ACL's)"
+        )
+    if len(acl) == 0:
+        raise ValueError(
+            "Invalid value for 'acl' (an empty ACL list is not allowed;"
+            " pass None to use the default ACL)"
+        )
+    for entry in acl:
+        if not isinstance(entry, ACL):
+            raise TypeError(
+                "Invalid type for 'acl' entry (ACL expected, got %r)"
+                % (entry,)
+            )
+    return acl
+
+
 # Kazoo retry parameters
 class KazooRetryParams(TypedDict, total=False):
     max_tries: int
@@ -243,6 +290,30 @@ class KazooClient:
                         :class:`~kazoo.interfaces.IHandler` interface
                         for callback handling.
         :param default_acl: A default ACL used on node creation.
+
+            This ACL is applied consistently by :meth:`create`,
+            :meth:`ensure_path`, :meth:`TransactionRequest.create`
+            (via :meth:`transaction`) and all recipes built on top of
+            them (locks, queues, ...) whenever a node is created
+            without an explicit ``acl`` argument. The full contract:
+
+            * ``acl=None`` (the default for all creation entry
+              points) uses this ``default_acl`` when set, otherwise
+              :data:`~kazoo.security.OPEN_ACL_UNSAFE`.
+            * An explicit non-empty tuple/list of
+              :class:`~kazoo.security.ACL` entries is used as-is and
+              takes precedence over ``default_acl``.
+            * An empty tuple/list raises :exc:`ValueError` before
+              anything is sent to ZooKeeper; it is never silently
+              replaced by a default.
+            * Any other invalid value raises :exc:`TypeError` before
+              anything is sent to ZooKeeper.
+
+            Parent nodes created implicitly (``create(...,
+            makepath=True)``, :meth:`ensure_path`, lock recipes)
+            receive the same resolved ACL as the final node. Nodes
+            that already exist are never re-created and never have
+            their ACL changed by these calls.
         :param auth_data:
             A list of authentication credentials to use for the
             connection. Should be a list of (scheme, credential)
@@ -1166,7 +1237,16 @@ class KazooClient:
 
         :param path: Path of node.
         :param value: Initial bytes value of node.
-        :param acl: :class:`~kazoo.security.ACL` list.
+        :param acl: :class:`~kazoo.security.ACL` list. If `None` (the
+                    default), the client's
+                    :attr:`~KazooClient.default_acl` is used when set,
+                    otherwise
+                    :data:`~kazoo.security.OPEN_ACL_UNSAFE`. When
+                    `makepath` is used, missing parent nodes are
+                    created with this same ACL. An empty list/tuple
+                    raises :exc:`ValueError`; other invalid values
+                    raise :exc:`TypeError` before anything is sent to
+                    ZooKeeper.
         :param ephemeral: Boolean indicating whether node is ephemeral
                           (tied to this session).
         :param sequence: Boolean indicating whether path is suffixed
@@ -1202,8 +1282,14 @@ class KazooClient:
             The `makepath` option.
         .. versionadded:: 2.7
             The `include_data` option.
+        .. versionchanged:: 2.12.0
+            The `acl` argument now follows one consistent contract
+            everywhere (see
+            :attr:`~KazooClient.default_acl`): an empty ACL list/tuple
+            now raises :exc:`ValueError` instead of being silently
+            replaced by `default_acl`, and invalid `acl` values are
+            rejected before any request is sent to ZooKeeper.
         """
-        acl = acl or self.default_acl
         return cast(
             "str | tuple[str, ZnodeStat]",
             self.create_async(
@@ -1236,18 +1322,13 @@ class KazooClient:
             The makepath option.
         .. versionadded:: 2.7
             The `include_data` option.
+        .. versionchanged:: 2.12.0
+            The `acl` argument follows the same consistent contract as
+            :meth:`create`; see :attr:`~KazooClient.default_acl`.
         """
-        if acl is None and self.default_acl:
-            acl = self.default_acl
-
         if not isinstance(path, str):
             raise TypeError("Invalid type for 'path' (string expected)")
-        if acl and (
-            isinstance(acl, ACL) or not isinstance(acl, (tuple, list))
-        ):
-            raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list of ACL's"
-            )
+        acl = _resolve_acl(acl, self.default_acl)
         if value is not None and not isinstance(value, bytes):
             raise TypeError("Invalid type for 'value' (must be a byte string)")
         if not isinstance(ephemeral, bool):
@@ -1264,8 +1345,6 @@ class KazooClient:
             flags |= 1
         if sequence:
             flags |= 2
-        if acl is None:
-            acl = OPEN_ACL_UNSAFE
 
         async_result = self.handler.async_result()
 
@@ -1274,12 +1353,7 @@ class KazooClient:
             result = self._create_async_inner(
                 path,
                 value,
-                # The way acl is constructed ends up confusing mypy, which
-                # thinks that acl can be None here, even though the code
-                # above ensures that if acl is None, it gets set to
-                # OPEN_ACL_UNSAFE, so we ignore the type error here.
-                # behaves differently in python3.8 and python3.14, sigh.
-                acl,  # type: ignore[arg-type]
+                acl,
                 flags,
                 trailing=sequence,
                 include_data=include_data,
@@ -1350,8 +1424,28 @@ class KazooClient:
     def ensure_path(self, path: str, acl: Sequence[ACL] | None = None) -> bool:
         """Recursively create a path if it doesn't exist.
 
+        Only missing nodes are created; nodes that already exist are
+        left untouched, including their data and ACL.
+
         :param path: Path of node.
-        :param acl: Permissions for node.
+        :param acl: Permissions for the created nodes. If `None` (the
+                    default), the client's
+                    :attr:`~KazooClient.default_acl` is used when set,
+                    otherwise
+                    :data:`~kazoo.security.OPEN_ACL_UNSAFE`. Every
+                    missing node along the path is created with this
+                    same ACL. An empty list/tuple raises
+                    :exc:`ValueError`; other invalid values raise
+                    :exc:`TypeError` before anything is sent to
+                    ZooKeeper.
+
+        .. versionchanged:: 2.12.0
+            The `acl` argument now follows one consistent contract
+            everywhere (see :attr:`~KazooClient.default_acl`): an
+            empty ACL list/tuple now raises :exc:`ValueError` instead
+            of being silently replaced by `default_acl`, and invalid
+            `acl` values are rejected before any request is sent to
+            ZooKeeper.
 
         """
         return cast("bool", self.ensure_path_async(path, acl).get())
@@ -1366,8 +1460,12 @@ class KazooClient:
 
         .. versionadded:: 1.1
 
+        .. versionchanged:: 2.12.0
+            The `acl` argument follows the same consistent contract as
+            :meth:`ensure_path`; see :attr:`~KazooClient.default_acl`.
+
         """
-        acl = acl or self.default_acl
+        acl = _resolve_acl(acl, self.default_acl)
         async_result = self.handler.async_result()
 
         @wrap(async_result)
@@ -1985,18 +2083,26 @@ class TransactionRequest:
         arguments as :meth:`KazooClient.create`, with the exception
         of `makepath`.
 
+        The `acl` argument follows the same contract as
+        :meth:`KazooClient.create`: `None` uses the client's
+        :attr:`~KazooClient.default_acl` when set, otherwise
+        :data:`~kazoo.security.OPEN_ACL_UNSAFE`; an empty list/tuple
+        raises :exc:`ValueError`; other invalid values raise
+        :exc:`TypeError` before the transaction is committed.
+
         :returns: None
 
-        """
-        if acl is None and self.client.default_acl:
-            acl = self.client.default_acl
+        .. versionchanged:: 2.12.0
+            An empty ACL list/tuple now raises :exc:`ValueError`
+            instead of being sent to ZooKeeper, and invalid `acl`
+            values are rejected when the operation is added to the
+            transaction rather than at commit time. See
+            :attr:`~KazooClient.default_acl` for the full contract.
 
+        """
         if not isinstance(path, str):
             raise TypeError("Invalid type for 'path' (string expected)")
-        if acl and not isinstance(acl, (tuple, list)):
-            raise TypeError(
-                "Invalid type for 'acl' (acl must be a tuple/list of ACL's"
-            )
+        acl = _resolve_acl(acl, self.client.default_acl)
         if not isinstance(value, bytes):
             raise TypeError("Invalid type for 'value' (must be a byte string)")
         if not isinstance(ephemeral, bool):
@@ -2009,8 +2115,6 @@ class TransactionRequest:
             flags |= 1
         if sequence:
             flags |= 2
-        if acl is None:
-            acl = OPEN_ACL_UNSAFE
 
         self._add(
             Create(_prefix_root(self.client.chroot, path), value, acl, flags),

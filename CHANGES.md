@@ -3,6 +3,17 @@
 
 #### Bug Fixes
 
+* **core:**
+  * unify the ACL default contract across `KazooClient.create` (including
+    `makepath` parent creation), `KazooClient.ensure_path`,
+    `TransactionRequest.create` and the lock recipes: `acl=None` now
+    consistently falls back to `default_acl` (then `OPEN_ACL_UNSAFE`), an
+    explicitly empty ACL list/tuple raises `ValueError` instead of being
+    silently replaced or sent to the server, and invalid ACL values raise
+    `TypeError` before any request is sent to ZooKeeper. Implicitly
+    created parent nodes receive the same resolved ACL as the final node;
+    pre-existing nodes are never re-created or re-ACL'd.
+
 * **protocol:**
   * handle `SASLException` and `SessionClosedRequireSaslError` cleanly as `AUTH_FAILED` in `_connect_attempt` (addresses #594)
 

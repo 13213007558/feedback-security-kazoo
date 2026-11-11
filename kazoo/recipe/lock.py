@@ -89,6 +89,19 @@ class Lock:
     This is an exclusive lock. For a read/write lock, see :class:`WriteLock`
     and :class:`ReadLock`.
 
+    The lock path (created via :meth:`~kazoo.client.KazooClient.ensure_path`)
+    and the ephemeral contender nodes (created via
+    :meth:`~kazoo.client.KazooClient.create`) do not take an explicit
+    ACL; they follow the client's ACL contract, i.e. the client's
+    :attr:`~kazoo.client.KazooClient.default_acl` is used when set,
+    otherwise :data:`~kazoo.security.OPEN_ACL_UNSAFE`. Set
+    ``default_acl`` on the client to keep lock nodes from being
+    world-readable/writable.
+
+    .. versionchanged:: 2.12.0
+        Lock node creation now shares the unified client ACL contract;
+        see :attr:`~kazoo.client.KazooClient.default_acl`.
+
     """
 
     # Node name, after the contender UUID, before the sequence

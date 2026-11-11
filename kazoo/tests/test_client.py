@@ -45,6 +45,8 @@ from kazoo.security import (
     ACL,
     OPEN_ACL_UNSAFE,
 )
+from kazoo.protocol.serialization import Create, Exists, GetChildren
+from kazoo.recipe.lock import Lock
 
 from kazoo.testing import KazooTestCase
 
@@ -134,6 +136,212 @@ class TestClientConstructor(unittest.TestCase):
         assert type(client._retry) is KazooRetry
         assert client._retry.max_tries == 99
         assert client._conn_retry.delay == 99
+
+
+class _FakeSerializationBoundary:
+    """Stand-in for ``KazooClient._call`` used by the ACL contract tests.
+
+    Records every :class:`~kazoo.protocol.serialization.Create`
+    request handed to the serialization layer and answers
+    Exists/Create/GetChildren like a minimal ZooKeeper server, so that
+    makepath/ensure_path/lock flows run to completion without a real
+    cluster.
+    """
+
+    def __init__(self, existing: Any = ()) -> None:
+        self.nodes = {"/"}
+        self.nodes.update(existing)
+        self.create_requests: list[Create] = []
+
+    def __call__(self, request: Any, async_result: "IAsyncResult") -> None:
+        if isinstance(request, Exists):
+            async_result.set(
+                request.path if request.path in self.nodes else None
+            )
+        elif isinstance(request, Create):
+            self.create_requests.append(request)
+            path = request.path
+            parent = path.rpartition("/")[0] or "/"
+            if parent not in self.nodes:
+                async_result.set_exception(NoNodeError())
+            elif request.flags & 2:  # sequential node
+                real_path = path + "0000000000"
+                self.nodes.add(real_path)
+                async_result.set(real_path)
+            elif path in self.nodes:
+                async_result.set_exception(NodeExistsError())
+            else:
+                self.nodes.add(path)
+                async_result.set(path)
+        elif isinstance(request, GetChildren):
+            prefix = request.path.rstrip("/") + "/"
+            children = [
+                node[len(prefix) :]
+                for node in self.nodes
+                if node.startswith(prefix)
+                and "/" not in node[len(prefix) :]
+            ]
+            async_result.set(children)
+        else:  # pragma: nocover
+            async_result.set_exception(
+                AssertionError("unexpected request %r" % (request,))
+            )
+
+
+class TestAclContract(unittest.TestCase):
+    """Unit tests for the unified ACL default contract.
+
+    The tests intercept requests at the serialization boundary
+    (``KazooClient._call``) and compare the ACLs of parent and final
+    nodes, without needing a running ZooKeeper cluster.
+    """
+
+    def setUp(self) -> None:
+        self.client = KazooClient()
+        self.server = _FakeSerializationBoundary()
+        self.client._call = self.server  # type: ignore[method-assign]
+
+    @staticmethod
+    def _digest_acl() -> ACL:
+        return make_digest_acl(
+            uuid.uuid4().hex, uuid.uuid4().hex, all=True
+        )
+
+    def _request_paths(self) -> list[str]:
+        return [request.path for request in self.server.create_requests]
+
+    def _request_acls(self) -> list[Any]:
+        return [request.acl for request in self.server.create_requests]
+
+    def test_create_makepath_uses_default_acl_for_parents_and_node(
+        self,
+    ) -> None:
+        self.client.default_acl = CREATOR_ALL_ACL
+        self.client.create("/a/b/c", makepath=True)
+        assert self._request_paths() == ["/a/b/c", "/a", "/a/b", "/a/b/c"]
+        for acl in self._request_acls():
+            assert acl == CREATOR_ALL_ACL
+
+    def test_create_explicit_acl_overrides_default(self) -> None:
+        explicit = (self._digest_acl(),)
+        self.client.default_acl = CREATOR_ALL_ACL
+        self.client.create("/a/b", acl=explicit, makepath=True)
+        assert self._request_paths() == ["/a/b", "/a", "/a/b"]
+        for acl in self._request_acls():
+            assert acl == explicit
+
+    def test_create_without_default_falls_back_to_open_acl_unsafe(
+        self,
+    ) -> None:
+        self.client.create("/a/b", makepath=True)
+        assert self._request_paths() == ["/a/b", "/a", "/a/b"]
+        for acl in self._request_acls():
+            assert acl == OPEN_ACL_UNSAFE
+
+    def test_create_empty_acl_rejected_before_sending(self) -> None:
+        self.client.default_acl = CREATOR_ALL_ACL
+        for empty_acl in ([], ()):
+            with pytest.raises(ValueError):
+                self.client.create("/a", acl=empty_acl)
+            with pytest.raises(ValueError):
+                self.client.create_async("/a", acl=empty_acl)
+            with pytest.raises(ValueError):
+                self.client.ensure_path("/a", acl=empty_acl)
+            with pytest.raises(ValueError):
+                self.client.transaction().create("/a", acl=empty_acl)
+        assert self.server.create_requests == []
+
+    def test_create_invalid_acl_rejected_before_sending(self) -> None:
+        single_acl = self._digest_acl()
+        invalid_acls: list[Any] = [
+            single_acl,  # a bare ACL, not a tuple/list of them
+            "world:anyone:cdrwa",
+            [single_acl, "not-an-acl"],
+        ]
+        for invalid_acl in invalid_acls:
+            with pytest.raises(TypeError):
+                self.client.create("/a", acl=invalid_acl)
+            with pytest.raises(TypeError):
+                self.client.ensure_path("/a", acl=invalid_acl)
+            with pytest.raises(TypeError):
+                self.client.transaction().create("/a", acl=invalid_acl)
+        assert self.server.create_requests == []
+
+    def test_empty_default_acl_rejected_before_sending(self) -> None:
+        self.client.default_acl = []
+        with pytest.raises(ValueError):
+            self.client.create("/a")
+        with pytest.raises(ValueError):
+            self.client.ensure_path("/a")
+        with pytest.raises(ValueError):
+            self.client.transaction().create("/a")
+        assert self.server.create_requests == []
+
+    def test_ensure_path_uses_default_acl_for_all_missing_ancestors(
+        self,
+    ) -> None:
+        self.client.default_acl = CREATOR_ALL_ACL
+        self.client.ensure_path("/a/b/c")
+        assert self._request_paths() == ["/a", "/a/b", "/a/b/c"]
+        for acl in self._request_acls():
+            assert acl == CREATOR_ALL_ACL
+
+    def test_ensure_path_explicit_acl_overrides_default(self) -> None:
+        explicit = (self._digest_acl(),)
+        self.client.default_acl = CREATOR_ALL_ACL
+        self.client.ensure_path("/a/b", acl=explicit)
+        assert self._request_paths() == ["/a", "/a/b"]
+        for acl in self._request_acls():
+            assert acl == explicit
+
+    def test_ensure_path_leaves_existing_nodes_alone(self) -> None:
+        self.server.nodes.add("/a")
+        self.server.nodes.add("/a/b")
+        self.client.default_acl = CREATOR_ALL_ACL
+        self.client.ensure_path("/a/b/c")
+        # only the missing node is created; existing ones are not
+        # re-created and their ACL is never touched
+        assert self._request_paths() == ["/a/b/c"]
+
+        self.server.create_requests[:] = []
+        self.client.ensure_path("/a/b/c")
+        assert self._request_paths() == []
+
+    def test_transaction_create_uses_default_acl(self) -> None:
+        self.client.default_acl = CREATOR_ALL_ACL
+        t = self.client.transaction()
+        t.create("/freddy")
+        assert t.operations[0].acl == CREATOR_ALL_ACL
+
+    def test_transaction_create_explicit_acl_overrides_default(
+        self,
+    ) -> None:
+        explicit = (self._digest_acl(),)
+        self.client.default_acl = CREATOR_ALL_ACL
+        t = self.client.transaction()
+        t.create("/freddy", acl=explicit)
+        assert t.operations[0].acl == explicit
+
+    def test_transaction_create_without_default_uses_open_acl_unsafe(
+        self,
+    ) -> None:
+        t = self.client.transaction()
+        t.create("/freddy")
+        assert t.operations[0].acl == OPEN_ACL_UNSAFE
+
+    def test_lock_uses_default_acl_for_path_and_contender_node(
+        self,
+    ) -> None:
+        self.client.default_acl = CREATOR_ALL_ACL
+        lock = Lock(self.client, "/locks/my-lock")
+        assert lock.acquire() is True
+        paths = self._request_paths()
+        assert "/locks" in paths
+        assert "/locks/my-lock" in paths
+        contender = [p for p in paths if p.startswith("/locks/my-lock/")]
+        assert len(contender) == 1
+        for acl in self._request_acls():
+            assert acl == CREATOR_ALL_ACL
 
 
 class TestAuthentication(KazooTestCase):
