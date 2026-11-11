@@ -5,6 +5,7 @@
 
 * **protocol:**
   * handle `SASLException` and `SessionClosedRequireSaslError` cleanly as `AUTH_FAILED` in `_connect_attempt` (addresses #594)
+  * only deliver `CONNECTED`/`CONNECTED_RO` after the server has accepted all configured credentials (SASL and `auth_data`), so a failed re-authentication no longer surfaces as a `CONNECTED` event followed by `AUTH_FAILED`
 
 
 <a name="2.11.0"></a>
