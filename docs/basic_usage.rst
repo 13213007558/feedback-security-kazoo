@@ -463,3 +463,94 @@ transaction is being used, `check`. This can check nodes for a specific
 version, which could be used to make the transaction fail if a node
 doesn't match a version that it should be at. In this case the node
 `/node/a` must be at version 3 or `/node/b` will not be created.
+
+Interpreting Transaction Results
+--------------------------------
+
+.. versionadded:: 2.12.0
+
+:meth:`~kazoo.client.TransactionRequest.commit` returns a
+:class:`~kazoo.client.TransactionResult`. It still behaves like the
+historical list of per-operation results for reading (indexing,
+iteration, ``len()``), but the outcome of the transaction itself must
+be checked explicitly through its :attr:`~kazoo.client.TransactionResult.status`:
+
+* ``TransactionStatus.COMMITTED`` — the server applied every operation
+  atomically.
+* ``TransactionStatus.ROLLED_BACK`` — the server rejected the
+  transaction (for example a version conflict, missing node, or
+  missing permission on one of the operations) and applied nothing.
+  ``result.error`` and ``result.error_index`` identify the cause.
+* ``TransactionStatus.UNKNOWN`` — the transaction was sent but the
+  connection was lost before the response arrived (or the response
+  was incomplete). The server may or may not have applied it. Kazoo
+  never replays the transaction automatically; reconcile against the
+  server state first.
+
+The result object has no boolean value: ``if transaction.commit():``
+raises :exc:`TypeError` instead of silently treating a failed
+transaction as success. Note that the ``committed`` attribute of
+:class:`~kazoo.client.TransactionRequest` (also available as
+``sent``) only records that the transaction was *sent*; it never
+indicates the server-side outcome.
+
+The example below shows a security-sensitive configuration update.
+It uses fake server responses so the decision flow can be run without
+a Zookeeper server: the caller writes an audit record only when the
+transaction is known to be committed, and escalates to manual review
+when the outcome is unknown.
+
+.. code-block:: python
+
+    import struct
+
+    from kazoo.client import KazooClient
+    from kazoo.exceptions import ConnectionLoss
+    from kazoo.protocol.serialization import (
+        CheckVersion, MultiHeader, SetData, Transaction, stat_struct,
+    )
+
+    STAT = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)
+    DONE = MultiHeader(-1, True, -1).serialize()
+
+    # A fake server response: check + set_data both succeeded.
+    success_response = (
+        MultiHeader(CheckVersion.type, False, -1).serialize()
+        + MultiHeader(SetData.type, False, -1).serialize()
+        + stat_struct.pack(*STAT)
+        + DONE
+    )
+
+    def fake_call(request, async_object):
+        # Stand-in for KazooClient._call plus the connection reader.
+        response = Transaction.deserialize(success_response, 0)
+        async_object.set(response)
+
+    zk = KazooClient()
+    zk._call = fake_call  # fake transport, no server involved
+
+    audit_log = []
+    manual_review_queue = []
+
+    transaction = zk.transaction()
+    transaction.check('/security/config', version=7)
+    transaction.set_data('/security/config', b'{"acl": "digest:ops"}', 7)
+    result = transaction.commit()
+
+    if result.is_committed:
+        # Safe to record the change as done.
+        audit_log.append(('committed', '/security/config'))
+    elif result.is_rolled_back:
+        # Definitely not applied; result.error says why (e.g.
+        # BadVersionError, NoAuthError, NoNodeError).
+        audit_log.append(('rolled_back', '/security/config', result.error))
+    else:
+        # Unknown: do NOT retry the transaction blindly. A human (or a
+        # reconciler that first reads back the server state) must
+        # decide whether the update went through.
+        manual_review_queue.append(('/security/config', result.cause))
+
+Replacing ``success_response`` with ``ConnectionLoss()`` passed to
+``async_object.set_exception`` in ``fake_call`` exercises the
+``UNKNOWN`` branch: the transaction is sent exactly once and ends up
+in ``manual_review_queue`` instead of the audit log.

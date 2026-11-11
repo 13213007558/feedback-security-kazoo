@@ -12,7 +12,7 @@ import struct
 from collections import namedtuple
 from typing import ClassVar, Sequence, Union, TYPE_CHECKING
 
-from kazoo.exceptions import EXCEPTIONS, ZookeeperError
+from kazoo.exceptions import EXCEPTIONS, MarshallingError, ZookeeperError
 from kazoo.protocol.states import ZnodeStat
 from kazoo.security import ACL
 from kazoo.security import Id
@@ -416,8 +416,8 @@ class Transaction(namedtuple("Transaction", "operations")):
     ) -> list[Transaction_Response]:
         header = MultiHeader(None, False, None)
         results: list[Transaction_Response] = []
-        response: Transaction_Response = None
         while not header.done:
+            response: Transaction_Response = None
             if header.type == Create.type:
                 response, offset = read_string(bytes, offset)
             elif header.type == Delete.type:
@@ -431,7 +431,12 @@ class Transaction(namedtuple("Transaction", "operations")):
                 err = int_struct.unpack_from(bytes, offset)[0]
                 offset += int_struct.size
                 response = EXCEPTIONS[err]()
-            if response:
+            elif header.type is not None:
+                raise MarshallingError(
+                    "Unknown transaction response header type: %r"
+                    % (header.type,)
+                )
+            if response is not None:
                 results.append(response)
             header, offset = MultiHeader.deserialize(bytes, offset)
         return results

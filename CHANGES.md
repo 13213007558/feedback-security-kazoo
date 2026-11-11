@@ -1,10 +1,27 @@
 <a name="unreleased"></a>
 ## Unreleased
 
+#### Features
+
+* **core:**
+  * `TransactionRequest.commit` now returns a `TransactionResult` that
+    clearly distinguishes an atomic server-side commit
+    (`TransactionStatus.COMMITTED`), a server-side rejection where
+    nothing was applied (`ROLLED_BACK`, with `error`/`error_index`
+    pinpointing the failed operation), and a lost connection where the
+    outcome is not known (`UNKNOWN`, never auto-replayed). The result
+    keeps list-like read access to the per-operation results, but
+    raises `TypeError` when used as a boolean so failed transactions
+    can no longer be mistaken for success.
+
 #### Bug Fixes
 
 * **protocol:**
   * handle `SASLException` and `SessionClosedRequireSaslError` cleanly as `AUTH_FAILED` in `_connect_attempt` (addresses #594)
+  * `Transaction.deserialize` no longer drops falsy results, no longer
+    duplicates the previous result on unknown multi headers (it raises
+    `MarshallingError` instead), and a short/malformed multi response
+    can no longer be reported as a successful commit.
 
 
 <a name="2.11.0"></a>

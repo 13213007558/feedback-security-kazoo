@@ -54,3 +54,11 @@ Public API
     .. autoclass:: TransactionRequest
         :members:
         :member-order: bysource
+
+    .. autoclass:: TransactionResult
+        :members:
+        :member-order: bysource
+
+    .. autoclass:: TransactionStatus
+        :members:
+        :member-order: bysource

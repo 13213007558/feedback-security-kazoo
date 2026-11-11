@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from enum import Enum
 from functools import partial
 import inspect
 import logging
@@ -33,8 +34,10 @@ from kazoo.exceptions import (
     KazooException,
     NoNodeError,
     NodeExistsError,
+    RolledBackError,
     SessionExpiredError,
     WriterNotClosedException,
+    ZookeeperError,
 )
 from kazoo.handlers.threading import SequentialThreadingHandler
 from kazoo.handlers.utils import capture_exceptions, wrap
@@ -1946,6 +1949,184 @@ class KazooClient:
         return async_result
 
 
+class TransactionStatus(Enum):
+    """The outcome of a committed :class:`TransactionRequest`.
+
+    .. versionadded:: 2.12.0
+
+    """
+
+    #: The server applied every operation atomically.
+    COMMITTED = "committed"
+
+    #: The server rejected the transaction; no operation was applied.
+    ROLLED_BACK = "rolled_back"
+
+    #: The transaction was sent but the connection was lost before the
+    #: response arrived (or the response was incomplete). The server
+    #: may or may not have applied it. The transaction must **not** be
+    #: replayed blindly; reconcile against the server state first.
+    UNKNOWN = "unknown"
+
+
+class TransactionResult(Sequence[Any]):
+    """The outcome of a :meth:`TransactionRequest.commit` call.
+
+    This object deliberately does **not** behave like a boolean:
+    ``bool(result)`` raises :exc:`TypeError`. Callers must make an
+    explicit decision based on :attr:`status` (or the ``is_committed``
+    / ``is_rolled_back`` / ``is_unknown`` properties) instead of
+    writing ``if zk.transaction().commit():``, which historically
+    evaluated to true for any non-empty result list, including failed
+    transactions.
+
+    For backwards compatibility the per-operation results remain
+    accessible through the sequence protocol (``len()``, indexing,
+    iteration, equality with a plain list) and via :attr:`results`.
+
+    .. versionadded:: 2.12.0
+
+    """
+
+    def __init__(
+        self,
+        status: TransactionStatus,
+        results: list[Any],
+        expected_operations: int,
+        error: ZookeeperError | None = None,
+        error_index: int | None = None,
+        cause: KazooException | None = None,
+    ):
+        self._status = status
+        self._results = list(results)
+        self._expected_operations = expected_operations
+        self._error = error
+        self._error_index = error_index
+        self._cause = cause
+
+    @classmethod
+    def from_response(
+        cls, results: list[Any], expected_operations: int
+    ) -> TransactionResult:
+        """Build a result from a deserialized multi response.
+
+        A response containing any :exc:`~kazoo.exceptions.ZookeeperError`
+        means the server rejected the transaction and applied nothing
+        (:attr:`TransactionStatus.ROLLED_BACK`). A response with fewer
+        entries than operations sent is malformed and can never be
+        reported as success (:attr:`TransactionStatus.UNKNOWN`).
+        """
+        errors = [
+            (index, result)
+            for index, result in enumerate(results)
+            if isinstance(result, ZookeeperError)
+        ]
+        if errors:
+            # The server marks operations before the failed one with
+            # RolledBackError; report the actual cause when available.
+            failures = [
+                (index, error)
+                for index, error in errors
+                if not isinstance(error, RolledBackError)
+            ]
+            error_index, error = failures[0] if failures else errors[0]
+            return cls(
+                TransactionStatus.ROLLED_BACK,
+                results,
+                expected_operations,
+                error=error,
+                error_index=error_index,
+            )
+        if len(results) != expected_operations:
+            return cls(TransactionStatus.UNKNOWN, results, expected_operations)
+        return cls(TransactionStatus.COMMITTED, results, expected_operations)
+
+    @classmethod
+    def unknown(
+        cls, expected_operations: int, cause: KazooException
+    ) -> TransactionResult:
+        """Build a result for a transaction whose outcome is not known.
+
+        Used when the connection was lost (or the session expired)
+        after the transaction was sent but before the server response
+        arrived.
+        """
+        return cls(
+            TransactionStatus.UNKNOWN,
+            [],
+            expected_operations,
+            cause=cause,
+        )
+
+    @property
+    def status(self) -> TransactionStatus:
+        """The :class:`TransactionStatus` of this transaction."""
+        return self._status
+
+    @property
+    def is_committed(self) -> bool:
+        """True only if the server atomically applied every operation."""
+        return self._status is TransactionStatus.COMMITTED
+
+    @property
+    def is_rolled_back(self) -> bool:
+        """True if the server rejected the transaction (nothing applied)."""
+        return self._status is TransactionStatus.ROLLED_BACK
+
+    @property
+    def is_unknown(self) -> bool:
+        """True if the outcome is unknown and must be reconciled."""
+        return self._status is TransactionStatus.UNKNOWN
+
+    @property
+    def results(self) -> list[Any]:
+        """The raw per-operation results list, as returned by the server."""
+        return self._results
+
+    @property
+    def error(self) -> ZookeeperError | None:
+        """The server error that aborted the transaction, if any."""
+        return self._error
+
+    @property
+    def error_index(self) -> int | None:
+        """Index of the operation that caused the rollback, if known."""
+        return self._error_index
+
+    @property
+    def cause(self) -> KazooException | None:
+        """The connection-level exception behind an UNKNOWN outcome."""
+        return self._cause
+
+    def __len__(self) -> int:
+        return len(self._results)
+
+    def __getitem__(self, index: Any) -> Any:
+        return self._results[index]
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, TransactionResult):
+            return (
+                self._status == other._status
+                and self._results == other._results
+            )
+        if isinstance(other, list):
+            return self._results == other
+        return NotImplemented
+
+    def __bool__(self) -> bool:
+        raise TypeError(
+            "TransactionResult has no boolean value; check result.status "
+            "or result.is_committed / is_rolled_back / is_unknown instead"
+        )
+
+    def __repr__(self) -> str:
+        return "TransactionResult(status=%s, results=%r)" % (
+            self._status.value,
+            self._results,
+        )
+
+
 class TransactionRequest:
     """A Zookeeper Transaction Request
 
@@ -1959,9 +2140,11 @@ class TransactionRequest:
     .. note::
 
         The ``committed`` attribute only indicates whether this
-        transaction has been sent to Zookeeper and is used to prevent
-        duplicate commits of the same transaction. The result should be
-        checked to determine if the transaction executed as desired.
+        transaction has been *sent* to Zookeeper and is used to prevent
+        duplicate commits of the same transaction. It says nothing
+        about the outcome. Use the :class:`TransactionResult` returned
+        by :meth:`commit` to determine whether the transaction was
+        applied, rolled back, or its outcome is unknown.
 
     .. versionadded:: 0.6
         Requires Zookeeper 3.4+
@@ -1972,6 +2155,19 @@ class TransactionRequest:
         self.client = client
         self.operations: list[Any] = []
         self.committed = False
+        self.result: TransactionResult | None = None
+
+    @property
+    def sent(self) -> bool:
+        """Whether the transaction has been sent to Zookeeper.
+
+        This is an alias for the ``committed`` attribute, which only
+        tracks submission, never the server-side outcome.
+
+        .. versionadded:: 2.12.0
+
+        """
+        return self.committed
 
     def create(
         self,
@@ -2062,23 +2258,58 @@ class TransactionRequest:
     def commit_async(self) -> IAsyncResult:
         """Commit the transaction asynchronously.
 
+        The async result is set with a :class:`TransactionResult`
+        rather than raising :exc:`~kazoo.exceptions.ConnectionLoss` or
+        :exc:`~kazoo.exceptions.SessionExpiredError`; those outcomes
+        are reported as :attr:`TransactionStatus.UNKNOWN` so callers
+        can reconcile instead of blindly replaying the transaction.
+
         :rtype: :class:`~kazoo.interfaces.IAsyncResult`
 
         """
         self._check_tx_state()
         self.committed = True
+        raw_result = self.client.handler.async_result()
+        self.client._call(Transaction(self.operations), raw_result)
         async_object = self.client.handler.async_result()
-        self.client._call(Transaction(self.operations), async_object)
+
+        def _deliver(raw: IAsyncResult) -> None:
+            try:
+                results = raw.get()
+            except (ConnectionLoss, SessionExpiredError) as exc:
+                async_object.set(
+                    TransactionResult.unknown(len(self.operations), exc)
+                )
+            except Exception as exc:
+                async_object.set_exception(exc)
+            else:
+                async_object.set(
+                    TransactionResult.from_response(
+                        results, len(self.operations)
+                    )
+                )
+
+        raw_result.rawlink(_deliver)
         return async_object
 
-    def commit(self) -> list[Any]:
-        """Commit the transaction.
+    def commit(self) -> TransactionResult:
+        """Commit the transaction exactly once.
 
-        :returns: A list of the results for each operation in the
-                  transaction.
+        The transaction is never automatically replayed. If the
+        connection is lost after the request was sent, the outcome is
+        reported as :attr:`TransactionStatus.UNKNOWN` and left for the
+        caller to reconcile.
+
+        :returns: A :class:`TransactionResult` describing whether the
+                  transaction was atomically committed, rolled back by
+                  the server, or its outcome is unknown. It also
+                  behaves like the historical list of per-operation
+                  results for reading (indexing, iteration, ``len()``).
 
         """
-        return cast("list[Any]", self.commit_async().get())
+        result = cast("TransactionResult", self.commit_async().get())
+        self.result = result
+        return result
 
     def __enter__(self) -> TransactionRequest:
         return self
